@@ -18,20 +18,26 @@ const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
+
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:3001",
   "http://127.0.0.1:3000",
-
-  // ✅ Your real Vercel frontend
   "https://opentlclient.vercel.app",
 ];
+
+const isOriginAllowed = (origin) => {
+    if (!origin) return true;
+    if (ALLOWED_ORIGINS.includes(origin)) return true;
+    if (origin.includes("localhost") || origin.includes("127.0.0.1") || origin.includes("192.168.") || origin.includes("10.")) return true;
+    return false;
+};
 const io = new Server(server, {
     cors: {
         origin: (origin, callback) => {
             // Allow requests with no origin (e.g., mobile apps, curl)
             if (!origin) return callback(null, true);
-            if (ALLOWED_ORIGINS.includes(origin)) {
+            if (isOriginAllowed(origin)) {
                 return callback(null, true);
             }
             console.warn("⚠️ Blocked CORS origin:", origin);
@@ -47,6 +53,7 @@ const io = new Server(server, {
 
 // Voice Presence & Signaling
 const voiceUsers = {}; // { roomId: [ { socketId, userId, username, avatar } ] }
+const meetingRooms = {}; // { roomId: [{ socketId, userId, userName, avatar }] }
 const channelUsers = {}; // { channelId: [ { socketId, userId, username, avatar, isTyping } ] }
 const typingUsers = {}; // { channelId: { userId: timeout } }
 const globalUsers = new Set(); // Track all connected users by socketId
@@ -247,6 +254,47 @@ io.on("connection", (socket) => {
         });
     });
 
+    // --- MEETING ROOM EVENTS ---
+    socket.on("meeting-join", (data) => {
+        const { roomId, userId, userName, avatar } = data;
+        socket.join(`meeting-${roomId}`);
+        if (!meetingRooms[roomId]) meetingRooms[roomId] = [];
+        meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
+        meetingRooms[roomId].push({ socketId: socket.id, userId, userName, avatar });
+        socket.emit("meeting-existing-users", meetingRooms[roomId].filter(u => u.socketId !== socket.id));
+        socket.to(`meeting-${roomId}`).emit("meeting-user-joined", { socketId: socket.id, userId, userName, avatar });
+        console.log(`Meeting join: ${userName} -> room ${roomId}`);
+    });
+
+    socket.on("meeting-offer", (data) => {
+        const { targetSocketId, offer, fromSocketId, userName } = data;
+        io.to(targetSocketId).emit("meeting-offer", { offer, fromSocketId, userName });
+    });
+
+    socket.on("meeting-answer", (data) => {
+        const { targetSocketId, answer, fromSocketId } = data;
+        io.to(targetSocketId).emit("meeting-answer", { answer, fromSocketId });
+    });
+
+    socket.on("meeting-ice-candidate", (data) => {
+        const { targetSocketId, candidate, fromSocketId } = data;
+        io.to(targetSocketId).emit("meeting-ice-candidate", { candidate, fromSocketId });
+    });
+
+    socket.on("meeting-leave", (data) => {
+        const { roomId } = data;
+        socket.leave(`meeting-${roomId}`);
+        if (meetingRooms[roomId]) {
+            meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
+            socket.to(`meeting-${roomId}`).emit("meeting-user-left", { socketId: socket.id });
+        }
+    });
+
+    socket.on("meeting-media-state", (data) => {
+        const { roomId, isMuted, isVideoOff } = data;
+        socket.to(`meeting-${roomId}`).emit("meeting-media-state", { socketId: socket.id, isMuted, isVideoOff });
+    });
+
     socket.on("disconnect", () => {
         console.log("Disconnected:", socket.id);
         
@@ -276,6 +324,15 @@ io.on("connection", (socket) => {
                 }
             }
         });
+
+        // Clean up meeting rooms
+        Object.keys(meetingRooms).forEach(roomId => {
+            const idx = meetingRooms[roomId].findIndex(u => u.socketId === socket.id);
+            if (idx !== -1) {
+                meetingRooms[roomId].splice(idx, 1);
+                io.to(`meeting-${roomId}`).emit("meeting-user-left", { socketId: socket.id });
+            }
+        });
     });
 });
 
@@ -283,7 +340,7 @@ io.on("connection", (socket) => {
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin) return callback(null, true);
-        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        if (isOriginAllowed(origin)) return callback(null, true);
         return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
