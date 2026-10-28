@@ -258,14 +258,13 @@ io.on("connection", (socket) => {
 
     // --- MEETING ROOM EVENTS ---
     socket.on("meeting-join", (data) => {
-        const { roomId, userId, userName, avatar } = data;
+        const { roomId, userId, userName, avatar, isMuted = false, isVideoOff = false } = data;
         socket.join(`meeting-${roomId}`);
         if (!meetingRooms[roomId]) meetingRooms[roomId] = [];
         meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
-        meetingRooms[roomId].push({ socketId: socket.id, userId, userName, avatar });
+        meetingRooms[roomId].push({ socketId: socket.id, userId, userName, avatar, isMuted, isVideoOff });
         socket.emit("meeting-existing-users", meetingRooms[roomId].filter(u => u.socketId !== socket.id));
-        socket.to(`meeting-${roomId}`).emit("meeting-user-joined", { socketId: socket.id, userId, userName, avatar });
-        console.log(`Meeting join: ${userName} -> room ${roomId}`);
+        socket.to(`meeting-${roomId}`).emit("meeting-user-joined", { socketId: socket.id, userId, userName, avatar, isMuted, isVideoOff });
     });
 
     socket.on("meeting-offer", (data) => {
@@ -294,6 +293,13 @@ io.on("connection", (socket) => {
 
     socket.on("meeting-media-state", (data) => {
         const { roomId, isMuted, isVideoOff } = data;
+        if (meetingRooms[roomId]) {
+            const user = meetingRooms[roomId].find(u => u.socketId === socket.id);
+            if (user) {
+                if (typeof isMuted === 'boolean') user.isMuted = isMuted;
+                if (typeof isVideoOff === 'boolean') user.isVideoOff = isVideoOff;
+            }
+        }
         socket.to(`meeting-${roomId}`).emit("meeting-media-state", { socketId: socket.id, isMuted, isVideoOff });
     });
 
