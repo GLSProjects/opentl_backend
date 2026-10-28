@@ -23,13 +23,15 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:3001",
   "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001",
+  "https://opentlfrontend2.vercel.app",
   "https://opentlclient.vercel.app",
 ];
 
 const isOriginAllowed = (origin) => {
     if (!origin) return true;
     if (ALLOWED_ORIGINS.includes(origin)) return true;
-    if (origin.includes("localhost") || origin.includes("127.0.0.1") || origin.includes("192.168.") || origin.includes("10.")) return true;
+    if (origin.includes("vercel.app") || origin.includes("localhost") || origin.includes("127.0.0.1") || origin.includes("192.168.") || origin.includes("10.")) return true;
     return false;
 };
 const io = new Server(server, {
