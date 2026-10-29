@@ -13,6 +13,7 @@ const meetingRoutes = require("./routes/meetingRoutes");
 const inviteRoutes = require("./routes/inviteRoutes");
 const communityRoutes = require("./routes/communityRoutes");
 const { activeRooms, roomParticipants } = require("./utils/meetingStore");
+const { verifyTokenAndGetUser } = require("./utils/verifyToken");
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -258,8 +259,15 @@ io.on("connection", (socket) => {
     });
 
     // --- MEETING ROOM EVENTS ---
-    socket.on("meeting-join", (data) => {
-        const { roomId, userId, userName, avatar, isMuted = false, isVideoOff = false, hostToken } = data;
+    socket.on("meeting-join", async (data) => {
+        const { roomId, isMuted = false, isVideoOff = false, token: payloadToken } = data || {};
+        const token = socket.handshake.auth?.token || payloadToken;
+        const verifiedUser = await verifyTokenAndGetUser(token);
+        if (!verifiedUser) {
+            socket.emit("meeting-error", { code: "UNAUTHORIZED", message: "Please login to join the meeting" });
+            return;
+        }
+
         const room = activeRooms.get(roomId);
         if (!room) {
             socket.emit("meeting-error", { code: "ROOM_NOT_FOUND", message: "Meeting room not found" });
@@ -270,17 +278,41 @@ io.on("connection", (socket) => {
             return;
         }
 
-        let isHost = false;
-        if (hostToken && room.hostToken && hostToken === room.hostToken) {
-            isHost = true;
+        const userId = verifiedUser._id.toString();
+        const userName = verifiedUser.displayName || verifiedUser.username;
+        const avatar = verifiedUser.avatar || userName.charAt(0).toUpperCase();
+
+        socket.data.meetingUser = {
+            userId,
+            userName,
+            avatar,
+            roomId,
+        };
+
+        if (!meetingRooms[roomId]) meetingRooms[roomId] = [];
+
+        const existingSession = meetingRooms[roomId].find(u => u.userId === userId && u.socketId !== socket.id);
+        if (existingSession) {
+            io.to(existingSession.socketId).emit("meeting-error", {
+                code: "REPLACED",
+                message: "You joined this meeting from another tab or window."
+            });
+            const oldSocket = io.sockets.sockets.get(existingSession.socketId);
+            if (oldSocket) {
+                oldSocket.leave(`meeting-${roomId}`);
+            }
+            meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== existingSession.socketId);
+            socket.to(`meeting-${roomId}`).emit("meeting-user-left", { socketId: existingSession.socketId });
+        }
+
+        const isHost = (room.hostUserId && room.hostUserId === userId) || (room.hostSocketId === socket.id);
+        if (isHost) {
             room.hostSocketId = socket.id;
             room.host = userName;
-        } else if (room.hostSocketId === socket.id) {
-            isHost = true;
+            room.hostUserId = userId;
         }
 
         socket.join(`meeting-${roomId}`);
-        if (!meetingRooms[roomId]) meetingRooms[roomId] = [];
         meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
         const participantObj = {
             socketId: socket.id,
@@ -299,21 +331,29 @@ io.on("connection", (socket) => {
     });
 
     socket.on("meeting-offer", (data) => {
-        const { targetSocketId, offer, fromSocketId, userName } = data;
-        io.to(targetSocketId).emit("meeting-offer", { offer, fromSocketId, userName });
+        if (!socket.data?.meetingUser) return;
+        const { targetSocketId, offer } = data;
+        io.to(targetSocketId).emit("meeting-offer", { 
+            offer, 
+            fromSocketId: socket.id, 
+            userName: socket.data.meetingUser.userName 
+        });
     });
 
     socket.on("meeting-answer", (data) => {
-        const { targetSocketId, answer, fromSocketId } = data;
-        io.to(targetSocketId).emit("meeting-answer", { answer, fromSocketId });
+        if (!socket.data?.meetingUser) return;
+        const { targetSocketId, answer } = data;
+        io.to(targetSocketId).emit("meeting-answer", { answer, fromSocketId: socket.id });
     });
 
     socket.on("meeting-ice-candidate", (data) => {
-        const { targetSocketId, candidate, fromSocketId } = data;
-        io.to(targetSocketId).emit("meeting-ice-candidate", { candidate, fromSocketId });
+        if (!socket.data?.meetingUser) return;
+        const { targetSocketId, candidate } = data;
+        io.to(targetSocketId).emit("meeting-ice-candidate", { candidate, fromSocketId: socket.id });
     });
 
     socket.on("meeting-leave", (data) => {
+        if (!socket.data?.meetingUser) return;
         const { roomId } = data;
         socket.leave(`meeting-${roomId}`);
         if (meetingRooms[roomId]) {
@@ -336,6 +376,7 @@ io.on("connection", (socket) => {
                 if (room) {
                     room.hostSocketId = newHost.socketId;
                     room.host = newHost.userName;
+                    room.hostUserId = newHost.userId;
                 }
                 io.to(`meeting-${roomId}`).emit("meeting-host-changed", {
                     newHostSocketId: newHost.socketId,
@@ -346,6 +387,7 @@ io.on("connection", (socket) => {
     });
 
     socket.on("meeting-media-state", (data) => {
+        if (!socket.data?.meetingUser) return;
         const { roomId, isMuted, isVideoOff } = data;
         if (meetingRooms[roomId]) {
             const user = meetingRooms[roomId].find(u => u.socketId === socket.id);
@@ -358,15 +400,15 @@ io.on("connection", (socket) => {
     });
 
     socket.on("meeting-end", (data) => {
+        if (!socket.data?.meetingUser) return;
         const { roomId } = data;
         const room = activeRooms.get(roomId);
         if (!room) return;
 
-        const sender = meetingRooms[roomId]?.find(u => u.socketId === socket.id);
-        const isAuthorizedHost = (sender && sender.isHost) || room.hostSocketId === socket.id;
+        const isAuthorizedHost = (room.hostUserId && room.hostUserId === socket.data.meetingUser.userId) || room.hostSocketId === socket.id;
         if (!isAuthorizedHost) return;
 
-        const hostName = sender?.userName || room.host || "Host";
+        const hostName = socket.data.meetingUser.userName || room.host || "Host";
         io.to(`meeting-${roomId}`).emit("meeting-ended", { roomId, endedBy: hostName });
 
         room.ended = true;

@@ -1,15 +1,18 @@
 const express = require('express');
 const router = express.Router();
 const { activeRooms, roomParticipants, generateHostToken } = require('../utils/meetingStore');
+const { protect } = require('../middleware/authMiddleware');
 
-router.post('/create', (req, res) => {
+router.post('/create', protect, (req, res) => {
   try {
-    const { roomName, hostName, isPrivate = false, maxParticipants = 10 } = req.body;
+    const { roomName, isPrivate = false, maxParticipants = 10 } = req.body;
 
-    if (!roomName || !hostName) {
-      return res.status(400).json({ error: 'Room name and host name are required' });
+    if (!roomName) {
+      return res.status(400).json({ error: 'Room name is required' });
     }
 
+    const hostName = req.user.displayName || req.user.username;
+    const hostUserId = req.user._id.toString();
     const roomId = generateRoomId();
     const hostToken = generateHostToken();
 
@@ -17,6 +20,7 @@ router.post('/create', (req, res) => {
       id: roomId,
       name: roomName,
       host: hostName,
+      hostUserId,
       hostToken,
       hostSocketId: null,
       participants: [],
@@ -42,6 +46,7 @@ router.post('/create', (req, res) => {
         id: roomId,
         name: roomName,
         host: hostName,
+        hostUserId,
         hostToken,
         participantCount: 0,
         maxParticipants
@@ -53,14 +58,10 @@ router.post('/create', (req, res) => {
   }
 });
 
-router.post('/:roomId/join', (req, res) => {
+router.post('/:roomId/join', protect, (req, res) => {
   try {
     const { roomId } = req.params;
-    const { userName, userAvatar, isAudioOnly = false } = req.body;
-
-    if (!userName) {
-      return res.status(400).json({ error: 'User name is required' });
-    }
+    const { isAudioOnly = false } = req.body;
 
     const room = activeRooms.get(roomId);
     if (!room || room.ended) {
@@ -71,17 +72,20 @@ router.post('/:roomId/join', (req, res) => {
       return res.status(403).json({ error: 'Meeting room is full' });
     }
 
-    const userId = generateUserId();
+    const userId = req.user._id.toString();
+    const userName = req.user.displayName || req.user.username;
+    const userAvatar = req.user.avatar || userName.charAt(0).toUpperCase();
+
     const participant = {
       id: userId,
       name: userName,
-      avatar: userAvatar || userName.charAt(0).toUpperCase(),
+      avatar: userAvatar,
       joinedAt: new Date(),
       isAudioOnly,
       isMuted: false,
       isVideoOff: false,
       hasScreenShare: false,
-      role: room.participants.length === 0 ? 'host' : 'participant'
+      role: room.hostUserId === userId ? 'host' : 'participant'
     };
 
     room.participants.push(participant);
@@ -96,7 +100,7 @@ router.post('/:roomId/join', (req, res) => {
       participant: {
         id: userId,
         name: userName,
-        avatar: userAvatar || userName.charAt(0).toUpperCase(),
+        avatar: userAvatar,
         role: participant.role,
         participantCount: room.participants.length
       },
@@ -115,10 +119,10 @@ router.post('/:roomId/join', (req, res) => {
   }
 });
 
-router.post('/:roomId/leave', (req, res) => {
+router.post('/:roomId/leave', protect, (req, res) => {
   try {
     const { roomId } = req.params;
-    const { userId } = req.body;
+    const userId = req.user._id.toString();
 
     const room = activeRooms.get(roomId);
     if (!room) {
@@ -144,7 +148,7 @@ router.post('/:roomId/leave', (req, res) => {
   }
 });
 
-router.get('/:roomId', (req, res) => {
+router.get('/:roomId', protect, (req, res) => {
   try {
     const { roomId } = req.params;
     const room = activeRooms.get(roomId);
@@ -159,6 +163,7 @@ router.get('/:roomId', (req, res) => {
         id: room.id,
         name: room.name,
         host: room.host,
+        hostUserId: room.hostUserId,
         participantCount: room.participants.length,
         maxParticipants: room.maxParticipants,
         isActive: room.isActive,
@@ -172,7 +177,7 @@ router.get('/:roomId', (req, res) => {
   }
 });
 
-router.get('/', (req, res) => {
+router.get('/', protect, (req, res) => {
   try {
     const rooms = Array.from(activeRooms.values())
       .filter(room => !room.ended && room.isActive)
@@ -180,6 +185,7 @@ router.get('/', (req, res) => {
         id: room.id,
         name: room.name,
         host: room.host,
+        hostUserId: room.hostUserId,
         participantCount: room.participants.length,
         maxParticipants: room.maxParticipants,
         isActive: room.isActive,
@@ -197,7 +203,7 @@ router.get('/', (req, res) => {
   }
 });
 
-router.put('/:roomId/participants/:userId/status', (req, res) => {
+router.put('/:roomId/participants/:userId/status', protect, (req, res) => {
   try {
     const { roomId, userId } = req.params;
     const { isMuted, isVideoOff, hasScreenShare } = req.body;
@@ -231,7 +237,7 @@ router.put('/:roomId/participants/:userId/status', (req, res) => {
   }
 });
 
-router.get('/:roomId/participants', (req, res) => {
+router.get('/:roomId/participants', protect, (req, res) => {
   try {
     const { roomId } = req.params;
     const room = activeRooms.get(roomId);
@@ -263,20 +269,15 @@ router.get('/:roomId/participants', (req, res) => {
   }
 });
 
-router.delete('/:roomId', (req, res) => {
+router.delete('/:roomId', protect, (req, res) => {
   try {
     const { roomId } = req.params;
-    const { hostId } = req.body;
-
     const room = activeRooms.get(roomId);
     if (!room) {
       return res.status(404).json({ error: 'Meeting room not found' });
     }
 
-    const participants = roomParticipants.get(roomId);
-    const hostParticipant = participants ? Array.from(participants.values()).find(p => p.role === 'host') : null;
-
-    if (!hostParticipant || hostParticipant.id !== hostId) {
+    if (room.hostUserId !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Only host can delete the meeting room' });
     }
 
@@ -297,10 +298,6 @@ router.delete('/:roomId', (req, res) => {
 
 function generateRoomId() {
   return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-}
-
-function generateUserId() {
-  return Math.random().toString(36).substring(2, 15);
 }
 
 module.exports = router;
