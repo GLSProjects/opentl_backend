@@ -1,15 +1,7 @@
-// Meeting Room Management API Routes
 const express = require('express');
 const router = express.Router();
+const { activeRooms, roomParticipants, generateHostToken } = require('../utils/meetingStore');
 
-// In-memory storage for demo (in production, use Redis or database)
-const activeRooms = new Map();
-const roomParticipants = new Map();
-const userSessions = new Map();
-
-// @desc    Create a new meeting room
-// @route   POST /api/meetings/create
-// @access  Public
 router.post('/create', (req, res) => {
   try {
     const { roomName, hostName, isPrivate = false, maxParticipants = 10 } = req.body;
@@ -19,15 +11,20 @@ router.post('/create', (req, res) => {
     }
 
     const roomId = generateRoomId();
+    const hostToken = generateHostToken();
+
     const room = {
       id: roomId,
       name: roomName,
       host: hostName,
+      hostToken,
+      hostSocketId: null,
       participants: [],
       maxParticipants,
       isPrivate,
       createdAt: new Date(),
       isActive: true,
+      ended: false,
       settings: {
         allowScreenShare: true,
         allowChat: true,
@@ -45,6 +42,7 @@ router.post('/create', (req, res) => {
         id: roomId,
         name: roomName,
         host: hostName,
+        hostToken,
         participantCount: 0,
         maxParticipants
       }
@@ -55,9 +53,6 @@ router.post('/create', (req, res) => {
   }
 });
 
-// @desc    Join a meeting room
-// @route   POST /api/meetings/:roomId/join
-// @access  Public
 router.post('/:roomId/join', (req, res) => {
   try {
     const { roomId } = req.params;
@@ -68,8 +63,8 @@ router.post('/:roomId/join', (req, res) => {
     }
 
     const room = activeRooms.get(roomId);
-    if (!room) {
-      return res.status(404).json({ error: 'Meeting room not found' });
+    if (!room || room.ended) {
+      return res.status(404).json({ error: 'Meeting room not found or ended' });
     }
 
     if (room.participants.length >= room.maxParticipants) {
@@ -90,9 +85,10 @@ router.post('/:roomId/join', (req, res) => {
     };
 
     room.participants.push(participant);
+    if (!roomParticipants.has(roomId)) {
+      roomParticipants.set(roomId, new Map());
+    }
     roomParticipants.get(roomId).set(userId, participant);
-
-    // Update room activity
     room.lastActivity = new Date();
 
     res.json({
@@ -119,9 +115,6 @@ router.post('/:roomId/join', (req, res) => {
   }
 });
 
-// @desc    Leave a meeting room
-// @route   POST /api/meetings/:roomId/leave
-// @access  Public
 router.post('/:roomId/leave', (req, res) => {
   try {
     const { roomId } = req.params;
@@ -135,11 +128,7 @@ router.post('/:roomId/leave', (req, res) => {
     const participants = roomParticipants.get(roomId);
     if (participants) {
       participants.delete(userId);
-      
-      // Remove from room participants array
       room.participants = room.participants.filter(p => p.id !== userId);
-      
-      // If room is empty, deactivate it
       if (room.participants.length === 0) {
         room.isActive = false;
       }
@@ -155,16 +144,13 @@ router.post('/:roomId/leave', (req, res) => {
   }
 });
 
-// @desc    Get meeting room info
-// @route   GET /api/meetings/:roomId
-// @access  Public
 router.get('/:roomId', (req, res) => {
   try {
     const { roomId } = req.params;
     const room = activeRooms.get(roomId);
 
-    if (!room) {
-      return res.status(404).json({ error: 'Meeting room not found' });
+    if (!room || room.ended) {
+      return res.status(404).json({ error: 'Meeting room not found or ended' });
     }
 
     res.json({
@@ -186,21 +172,20 @@ router.get('/:roomId', (req, res) => {
   }
 });
 
-// @desc    Get all active meeting rooms
-// @route   GET /api/meetings
-// @access  Public
 router.get('/', (req, res) => {
   try {
-    const rooms = Array.from(activeRooms.values()).map(room => ({
-      id: room.id,
-      name: room.name,
-      host: room.host,
-      participantCount: room.participants.length,
-      maxParticipants: room.maxParticipants,
-      isActive: room.isActive,
-      createdAt: room.createdAt,
-      isPrivate: room.isPrivate
-    }));
+    const rooms = Array.from(activeRooms.values())
+      .filter(room => !room.ended && room.isActive)
+      .map(room => ({
+        id: room.id,
+        name: room.name,
+        host: room.host,
+        participantCount: room.participants.length,
+        maxParticipants: room.maxParticipants,
+        isActive: room.isActive,
+        createdAt: room.createdAt,
+        isPrivate: room.isPrivate
+      }));
 
     res.json({
       success: true,
@@ -212,9 +197,6 @@ router.get('/', (req, res) => {
   }
 });
 
-// @desc    Update participant status (mute, video off, screen share)
-// @route   PUT /api/meetings/:roomId/participants/:userId/status
-// @access  Public
 router.put('/:roomId/participants/:userId/status', (req, res) => {
   try {
     const { roomId, userId } = req.params;
@@ -230,7 +212,6 @@ router.put('/:roomId/participants/:userId/status', (req, res) => {
       return res.status(404).json({ error: 'Participant not found' });
     }
 
-    // Update participant status
     if (isMuted !== undefined) participant.isMuted = isMuted;
     if (isVideoOff !== undefined) participant.isVideoOff = isVideoOff;
     if (hasScreenShare !== undefined) participant.hasScreenShare = hasScreenShare;
@@ -250,19 +231,17 @@ router.put('/:roomId/participants/:userId/status', (req, res) => {
   }
 });
 
-// @desc    Get meeting participants
-// @route   GET /api/meetings/:roomId/participants
-// @access  Public
 router.get('/:roomId/participants', (req, res) => {
   try {
     const { roomId } = req.params;
     const room = activeRooms.get(roomId);
 
-    if (!room) {
-      return res.status(404).json({ error: 'Meeting room not found' });
+    if (!room || room.ended) {
+      return res.status(404).json({ error: 'Meeting room not found or ended' });
     }
 
-    const participants = Array.from(roomParticipants.get(roomId).values()).map(p => ({
+    const map = roomParticipants.get(roomId);
+    const participants = map ? Array.from(map.values()).map(p => ({
       id: p.id,
       name: p.name,
       avatar: p.avatar,
@@ -272,7 +251,7 @@ router.get('/:roomId/participants', (req, res) => {
       isVideoOff: p.isVideoOff,
       hasScreenShare: p.hasScreenShare,
       isAudioOnly: p.isAudioOnly
-    }));
+    })) : [];
 
     res.json({
       success: true,
@@ -284,9 +263,6 @@ router.get('/:roomId/participants', (req, res) => {
   }
 });
 
-// @desc    Delete a meeting room (host only)
-// @route   DELETE /api/meetings/:roomId
-// @access  Public
 router.delete('/:roomId', (req, res) => {
   try {
     const { roomId } = req.params;
@@ -297,15 +273,15 @@ router.delete('/:roomId', (req, res) => {
       return res.status(404).json({ error: 'Meeting room not found' });
     }
 
-    // Find host participant
     const participants = roomParticipants.get(roomId);
-    const hostParticipant = Array.from(participants.values()).find(p => p.role === 'host');
+    const hostParticipant = participants ? Array.from(participants.values()).find(p => p.role === 'host') : null;
 
     if (!hostParticipant || hostParticipant.id !== hostId) {
       return res.status(403).json({ error: 'Only host can delete the meeting room' });
     }
 
-    // Remove room
+    room.ended = true;
+    room.isActive = false;
     activeRooms.delete(roomId);
     roomParticipants.delete(roomId);
 
@@ -319,7 +295,6 @@ router.delete('/:roomId', (req, res) => {
   }
 });
 
-// Helper functions
 function generateRoomId() {
   return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 }

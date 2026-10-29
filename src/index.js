@@ -12,6 +12,7 @@ const chatbotRoutes = require("./routes/chatbotRoutes");
 const meetingRoutes = require("./routes/meetingRoutes");
 const inviteRoutes = require("./routes/inviteRoutes");
 const communityRoutes = require("./routes/communityRoutes");
+const { activeRooms, roomParticipants } = require("./utils/meetingStore");
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -258,13 +259,43 @@ io.on("connection", (socket) => {
 
     // --- MEETING ROOM EVENTS ---
     socket.on("meeting-join", (data) => {
-        const { roomId, userId, userName, avatar, isMuted = false, isVideoOff = false } = data;
+        const { roomId, userId, userName, avatar, isMuted = false, isVideoOff = false, hostToken } = data;
+        const room = activeRooms.get(roomId);
+        if (!room) {
+            socket.emit("meeting-error", { code: "ROOM_NOT_FOUND", message: "Meeting room not found" });
+            return;
+        }
+        if (room.ended || !room.isActive) {
+            socket.emit("meeting-error", { code: "ROOM_ENDED", message: "This meeting has ended" });
+            return;
+        }
+
+        let isHost = false;
+        if (hostToken && room.hostToken && hostToken === room.hostToken) {
+            isHost = true;
+            room.hostSocketId = socket.id;
+            room.host = userName;
+        } else if (room.hostSocketId === socket.id) {
+            isHost = true;
+        }
+
         socket.join(`meeting-${roomId}`);
         if (!meetingRooms[roomId]) meetingRooms[roomId] = [];
         meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
-        meetingRooms[roomId].push({ socketId: socket.id, userId, userName, avatar, isMuted, isVideoOff });
+        const participantObj = {
+            socketId: socket.id,
+            userId,
+            userName,
+            avatar,
+            isMuted,
+            isVideoOff,
+            isHost,
+            joinedAt: Date.now()
+        };
+        meetingRooms[roomId].push(participantObj);
+
         socket.emit("meeting-existing-users", meetingRooms[roomId].filter(u => u.socketId !== socket.id));
-        socket.to(`meeting-${roomId}`).emit("meeting-user-joined", { socketId: socket.id, userId, userName, avatar, isMuted, isVideoOff });
+        socket.to(`meeting-${roomId}`).emit("meeting-user-joined", participantObj);
     });
 
     socket.on("meeting-offer", (data) => {
@@ -286,8 +317,31 @@ io.on("connection", (socket) => {
         const { roomId } = data;
         socket.leave(`meeting-${roomId}`);
         if (meetingRooms[roomId]) {
+            const leavingUser = meetingRooms[roomId].find(u => u.socketId === socket.id);
             meetingRooms[roomId] = meetingRooms[roomId].filter(u => u.socketId !== socket.id);
             socket.to(`meeting-${roomId}`).emit("meeting-user-left", { socketId: socket.id });
+
+            if (meetingRooms[roomId].length === 0) {
+                const room = activeRooms.get(roomId);
+                if (room) {
+                    room.isActive = false;
+                    activeRooms.delete(roomId);
+                    roomParticipants.delete(roomId);
+                }
+            } else if (leavingUser && leavingUser.isHost) {
+                const sorted = [...meetingRooms[roomId]].sort((a, b) => a.joinedAt - b.joinedAt);
+                const newHost = sorted[0];
+                newHost.isHost = true;
+                const room = activeRooms.get(roomId);
+                if (room) {
+                    room.hostSocketId = newHost.socketId;
+                    room.host = newHost.userName;
+                }
+                io.to(`meeting-${roomId}`).emit("meeting-host-changed", {
+                    newHostSocketId: newHost.socketId,
+                    newHostName: newHost.userName
+                });
+            }
         }
     });
 
@@ -301,6 +355,27 @@ io.on("connection", (socket) => {
             }
         }
         socket.to(`meeting-${roomId}`).emit("meeting-media-state", { socketId: socket.id, isMuted, isVideoOff });
+    });
+
+    socket.on("meeting-end", (data) => {
+        const { roomId } = data;
+        const room = activeRooms.get(roomId);
+        if (!room) return;
+
+        const sender = meetingRooms[roomId]?.find(u => u.socketId === socket.id);
+        const isAuthorizedHost = (sender && sender.isHost) || room.hostSocketId === socket.id;
+        if (!isAuthorizedHost) return;
+
+        const hostName = sender?.userName || room.host || "Host";
+        io.to(`meeting-${roomId}`).emit("meeting-ended", { roomId, endedBy: hostName });
+
+        room.ended = true;
+        room.isActive = false;
+        activeRooms.delete(roomId);
+        roomParticipants.delete(roomId);
+        delete meetingRooms[roomId];
+
+        io.in(`meeting-${roomId}`).socketsLeave(`meeting-${roomId}`);
     });
 
     socket.on("disconnect", () => {
@@ -333,12 +408,34 @@ io.on("connection", (socket) => {
             }
         });
 
-        // Clean up meeting rooms
         Object.keys(meetingRooms).forEach(roomId => {
             const idx = meetingRooms[roomId].findIndex(u => u.socketId === socket.id);
             if (idx !== -1) {
+                const leavingUser = meetingRooms[roomId][idx];
                 meetingRooms[roomId].splice(idx, 1);
                 io.to(`meeting-${roomId}`).emit("meeting-user-left", { socketId: socket.id });
+
+                if (meetingRooms[roomId].length === 0) {
+                    const room = activeRooms.get(roomId);
+                    if (room) {
+                        room.isActive = false;
+                        activeRooms.delete(roomId);
+                        roomParticipants.delete(roomId);
+                    }
+                } else if (leavingUser && leavingUser.isHost) {
+                    const sorted = [...meetingRooms[roomId]].sort((a, b) => a.joinedAt - b.joinedAt);
+                    const newHost = sorted[0];
+                    newHost.isHost = true;
+                    const room = activeRooms.get(roomId);
+                    if (room) {
+                        room.hostSocketId = newHost.socketId;
+                        room.host = newHost.userName;
+                    }
+                    io.to(`meeting-${roomId}`).emit("meeting-host-changed", {
+                        newHostSocketId: newHost.socketId,
+                        newHostName: newHost.userName
+                    });
+                }
             }
         });
     });
