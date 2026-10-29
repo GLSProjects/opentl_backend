@@ -5,7 +5,7 @@ const { protect } = require('../middleware/authMiddleware');
 
 router.post('/create', protect, (req, res) => {
   try {
-    const { roomName, isPrivate = false, maxParticipants = 10 } = req.body;
+    const { roomName } = req.body;
 
     if (!roomName) {
       return res.status(400).json({ error: 'Room name is required' });
@@ -24,15 +24,12 @@ router.post('/create', protect, (req, res) => {
       hostToken,
       hostSocketId: null,
       participants: [],
-      maxParticipants,
-      isPrivate,
       createdAt: new Date(),
       isActive: true,
       ended: false,
       settings: {
         allowScreenShare: true,
         allowChat: true,
-        requirePassword: isPrivate,
         recordingEnabled: false
       }
     };
@@ -48,8 +45,7 @@ router.post('/create', protect, (req, res) => {
         host: hostName,
         hostUserId,
         hostToken,
-        participantCount: 0,
-        maxParticipants
+        participantCount: 0
       }
     });
   } catch (error) {
@@ -66,10 +62,6 @@ router.post('/:roomId/join', protect, (req, res) => {
     const room = activeRooms.get(roomId);
     if (!room || room.ended) {
       return res.status(404).json({ error: 'Meeting room not found or ended' });
-    }
-
-    if (room.participants.length >= room.maxParticipants) {
-      return res.status(403).json({ error: 'Meeting room is full' });
     }
 
     const userId = req.user._id.toString();
@@ -109,7 +101,6 @@ router.post('/:roomId/join', protect, (req, res) => {
         name: room.name,
         host: room.host,
         participantCount: room.participants.length,
-        maxParticipants: room.maxParticipants,
         settings: room.settings
       }
     });
@@ -165,7 +156,6 @@ router.get('/:roomId', protect, (req, res) => {
         host: room.host,
         hostUserId: room.hostUserId,
         participantCount: room.participants.length,
-        maxParticipants: room.maxParticipants,
         isActive: room.isActive,
         createdAt: room.createdAt,
         settings: room.settings
@@ -187,10 +177,8 @@ router.get('/', protect, (req, res) => {
         host: room.host,
         hostUserId: room.hostUserId,
         participantCount: room.participants.length,
-        maxParticipants: room.maxParticipants,
         isActive: room.isActive,
-        createdAt: room.createdAt,
-        isPrivate: room.isPrivate
+        createdAt: room.createdAt
       }));
 
     res.json({
